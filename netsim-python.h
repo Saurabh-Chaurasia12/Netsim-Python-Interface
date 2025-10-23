@@ -101,14 +101,17 @@ void free_message(void* message_v);
 /* Initialize an empty MESSAGE object (caller must free via free_message). */
 MESSAGE* Init_Message(void);
 
-/* Variadic convenience:
- * add_variable_to_message(msg, 4,
- *                                SEG_INT_ARRAY, arr, 3,
- *                                SEG_DOUBLE, 3.14,
- *                                VAR_END);
- * Caller must provide no of variables the correct varargs.
- */
-void add_variable_to_message(void* message_v, unsigned int varcount, ...);
+/* === add_variable_to_message (variadic) ===
+   Usage pattern:
+     add_variable_to_message(m,
+        SEG_INT, 42,
+        SEG_INT_ARRAY, int_arr_ptr, (unsigned int)len,
+        SEG_STRING, "hello", (unsigned int)5,
+        SEG_DOUBLE_ARRAY, dbl_arr_ptr, (unsigned int)len,
+        VAR_END);
+   Caller must provide the proper arguments for each type and terminate with VAR_END.
+*/
+void add_variable_to_message(void *message_v, ...);
 
 /* === Sending / receiving helpers === */
 
@@ -140,6 +143,10 @@ uint32_t get_variablecount(void* message_v);
 
 /* Return SEGMENT* at zero-based index (or NULL). Optionally fill type_ptr and count_ptr. */
 void* get_variable_from_message(void* message_v, uint32_t index, uint16_t *type_ptr, uint32_t *count_ptr);
+
+/* === Debugging helpers === */
+/* Print segment info to stderr (if want_raw is non-zero, print raw payload bytes as hex) */
+void debug_print_message(const MESSAGE* m, int want_raw);
 
 /* === Lightweight conversion helpers for external use (take a pointer to a serialized
  * segment buffer starting at the 6-byte header, i.e. pointer layout: [2 bytes type][4 bytes count][payload...]).

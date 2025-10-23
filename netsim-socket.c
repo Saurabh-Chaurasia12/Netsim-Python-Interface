@@ -195,7 +195,7 @@ void* Init_AI_ML_Interface() {
         return NULL;
     }
 
-    printf("[NetSim] Listening on port %d...\n", PORT);
+    printf("Listening on port %d...\n", PORT);
     h->listen_fd = sockfd;
 
     struct sockaddr_in cli;
@@ -210,7 +210,7 @@ void* Init_AI_ML_Interface() {
     }
 
     h->conn_fd = conn;
-    printf("[NetSim] Client connected.\n");
+    printf("Client connected.\n");
     return (void*)h;
 }
 
@@ -428,67 +428,68 @@ static void add_string_to_message(void* message_v, const char* str) {
         VAR_END);
    Caller must provide the proper arguments for each type and terminate with VAR_END.
 */
-void add_variable_to_message(void* message_v, unsigned int varcount, ...) {
-    if (!message_v) return;
-    MESSAGE *m = (MESSAGE*) message_v;
-
+void add_variable_to_message(void *message_v, ...){
+    if (!message_v){
+        return;
+    }
+    MESSAGE *m = (MESSAGE *)message_v;
     va_list ap;
-    va_start(ap, varcount);
-
-    for (unsigned int i = 0; i < varcount; ++i) {
+    va_start(ap, message_v);
+    while (1){
         unsigned int t_promoted = va_arg(ap, unsigned int);
-        uint16_t t = (uint16_t) t_promoted;
-
-        switch (t) {
-            case SEG_INT: {
+        uint16_t t = (uint16_t)t_promoted;
+        if (t == VAR_END){
+            break;
+        }
+        switch (t){
+            case SEG_INT:{
                 int v = va_arg(ap, int);
                 add_int_to_message(m, v);
                 break;
             }
-            case SEG_DOUBLE: {
+            case SEG_DOUBLE:{
                 double d = va_arg(ap, double);
                 add_double_to_message(m, d);
                 break;
             }
-            case SEG_STRING: {
-                const char *str = va_arg(ap, const char*);
+            case SEG_STRING:{
+                const char *str = va_arg(ap, const char *);
                 add_string_to_message(m, str);
                 break;
             }
-            case SEG_INT_ARRAY: {
-                int *arr = va_arg(ap, int*);
+            case SEG_INT_ARRAY:{
+                int *arr = va_arg(ap, int *);
                 unsigned int len = va_arg(ap, unsigned int);
                 add_intarray_to_message(m, arr, (uint32_t)len);
                 break;
             }
-            case SEG_DOUBLE_ARRAY: {
-                double *arrd = va_arg(ap, double*);
+            case SEG_DOUBLE_ARRAY:{
+                double *arrd = va_arg(ap, double *);
                 unsigned int len = va_arg(ap, unsigned int);
                 add_doublearray_to_message(m, arrd, (uint32_t)len);
                 break;
             }
             case SEG_CHAR: {
                 /* single char passed as int (promotion) */
-                int ci = va_arg(ap, int);
-                char c = (char)ci;
+            int ci = va_arg(ap, int);
+            char c = (char)ci;
                 add_char_to_message(m, c);
-                break;
+            break;
             }
-            case SEG_BOOL: {
+            case SEG_BOOL:{
+                /* treat bool as single int (0/1) for now */
                 int bi = va_arg(ap, int);
                 add_int_to_message(m, bi ? 1 : 0);
                 break;
             }
             default:
-                fprintf(stderr, "add_variable_count: unsupported type %u\n", (unsigned int)t);
+                fprintf(stderr, "add_variable_to_message: unsupported type %u\n", (unsigned int)t); /* cannot reliably skip varargs for unknown type; aborting */
                 va_end(ap);
                 return;
-        }
+            }
     }
-
     va_end(ap);
 }
-
 
 /* form_segment_bytes: fragment aware */
 static uint32_t form_segment_bytes(uint32_t max_size, SEGMENT **segment_ptr, char *outbuf) {
@@ -573,10 +574,104 @@ static uint32_t form_segment_bytes(uint32_t max_size, SEGMENT **segment_ptr, cha
     return used;
 }
 
+/* free_message */
+void free_message(void* message_v) {
+    MESSAGE *m = (MESSAGE*)message_v;
+    if (!m) return;
+    SEGMENT *s = m->head;
+    while (s) {
+        SEGMENT *n = s->next;
+        if (s->raw) { free(s->raw); s->raw = NULL; }
+        if (s->sval) { free(s->sval); s->sval = NULL; } // note: for strings we may have set sval=raw and raw=NULL
+        if (s->ivals) { free(s->ivals); s->ivals = NULL; }
+        if (s->dvals) { free(s->dvals); s->dvals = NULL; }
+        if (s->bvals) { free(s->bvals); s->bvals = NULL; }
+        free(s);
+        s = n;
+    }
+    free(m);
+}
+
+/* validate a single segment before sending (sender-side) */
+static int validate_segment_for_send(const SEGMENT *s) {
+    if (!s) return -1;
+    if (s->count == 0 && s->size_in_bytes == 0) {
+        // allow zero-length segment only for explicit use-cases
+        return 0;
+    }
+
+    uint32_t expected_bytes = elem_size_by_type(s->type) * s->count;
+    if (s->type == SEG_STRING) {
+        // string's 'count' is length WITHOUT terminator; stored size should be count+1
+        expected_bytes = s->count + 1;
+    } else if (s->type == SEG_CHAR) {
+        // char array: count bytes, no terminator in our design
+        expected_bytes = s->count;
+    }
+
+    if (s->size_in_bytes != expected_bytes) {
+        fprintf(stderr, "validate_segment_for_send: mismatch size_in_bytes (%u) vs expected (%u) for type %u\n",
+                s->size_in_bytes, expected_bytes, (unsigned)s->type);
+        return -1;
+    }
+
+    // type-specific checks
+    if ((s->type == SEG_INT || s->type == SEG_INT_ARRAY) && s->count > 0) {
+        if (!s->ivals) {
+            fprintf(stderr, "validate_segment_for_send: ivals is NULL for int segment\n");
+            return -1;
+        }
+    }
+    if ((s->type == SEG_DOUBLE || s->type == SEG_DOUBLE_ARRAY) && s->count > 0) {
+        if (!s->dvals) {
+            fprintf(stderr, "validate_segment_for_send: dvals is NULL for double segment\n");
+            return -1;
+        }
+    }
+    if (s->type == SEG_STRING) {
+        if (!s->sval) {
+            fprintf(stderr, "validate_segment_for_send: sval is NULL for string\n");
+            return -1;
+        }
+        // ensure nul terminator present at expected position
+        if ((unsigned)strlen(s->sval) != s->count) {
+            fprintf(stderr, "validate_segment_for_send: string length %zu does not equal count %u\n",
+                    strlen(s->sval), s->count);
+            return -1;
+        }
+    }
+    if (s->type == SEG_BOOL && s->count > 0) {
+        if (!s->bvals && !s->ivals) {
+            fprintf(stderr, "validate_segment_for_send: bool segment has no backing storage\n");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/* validate whole message before send */
+static int validate_message_for_send(const MESSAGE *m) {
+    if (!m) return -1;
+    SEGMENT *s = m->head;
+    while (s) {
+        if (validate_segment_for_send(s) != 0) {
+            fprintf(stderr, "validate_message_for_send: segment validation failed (type=%u)\n", s->type);
+            return -1;
+        }
+        s = s->next;
+    }
+    return 0;
+}
+
 /* send_message */
 static int send_message(void* ai_handle_v, void* message_v) {
     AI_HANDLE *ai = (AI_HANDLE*)ai_handle_v;
     MESSAGE *m = (MESSAGE*)message_v;
+    if (validate_message_for_send(m) != 0) {
+        fprintf(stderr,"send_message: validation failed, aborting send\n");
+        return -1;
+    }
     if (!ai || !m) return -1;
     SEGMENT *index = m->head;
     char payload[MAX_CHUNK_PAYLOAD];
@@ -593,7 +688,9 @@ static int send_message(void* ai_handle_v, void* message_v) {
         if (send_all(ai->conn_fd, &netlen, 4) != 4) { fprintf(stderr,"send len failed\n"); return -1; }
         if (send_all(ai->conn_fd, payload, n) != (int)n) { fprintf(stderr,"send payload failed\n"); return -1; }
 
+        fprintf(stderr,"chunk sent, waiting for ack...\n");
         if (recv_all(ai->conn_fd, ack, (int)ack_len) <= 0) { fprintf(stderr,"recv ack failed\n"); return -1; }
+        fprintf(stderr,"ack received\n");
         ack[ack_len] = '\0';
         if (strncmp(ack, ACK_STR, ack_len) != 0) {
             fprintf(stderr,"expected %s, got '%s'\n", ACK_STR, ack);
@@ -606,13 +703,87 @@ static int send_message(void* ai_handle_v, void* message_v) {
     uint32_t netendlen = htonl(endlen);
     if (send_all(ai->conn_fd, &netendlen, 4) != 4) { fprintf(stderr,"send end len failed\n"); return -1; }
     if (send_all(ai->conn_fd, endmsg, (int)endlen) != (int)endlen) { fprintf(stderr,"send end payload failed\n"); return -1; }
-
+    fprintf(stderr,"sending end marker...\n");
     size_t ok_len = strlen(OK_STR);
     if (recv_all(ai->conn_fd, ack, (int)ok_len) <= 0) { fprintf(stderr,"recv ok failed\n"); return -1; }
+    fprintf(stderr,"end ack received\n");
+
     ack[ok_len] = '\0';
     if (strncmp(ack, OK_STR, ok_len) != 0) {
         fprintf(stderr,"expected %s, got '%s'\n", OK_STR, ack);
         return -1;
+    }
+    return 0;
+}
+
+/* validate a reassembled segment after receiving (receiver-side)
+   Checks raw buffer length vs expected, element alignment, and decodes consistency. */
+static int validate_segment_on_receive(const SEGMENT *s) {
+    if (!s) return -1;
+    uint32_t expected_bytes = elem_size_by_type(s->type) * s->count;
+    if (s->type == SEG_STRING) expected_bytes = s->count + 1;
+    else if (s->type == SEG_CHAR) expected_bytes = s->count;
+
+    if (s->size_in_bytes != expected_bytes) {
+        fprintf(stderr, "validate_segment_on_receive: size_in_bytes (%u) != expected (%u) for type %u\n",
+                s->size_in_bytes, expected_bytes, (unsigned)s->type);
+        return -1;
+    }
+
+    if ((s->type == SEG_INT || s->type == SEG_INT_ARRAY) && (s->size_in_bytes % 4 != 0)) {
+        fprintf(stderr, "validate_segment_on_receive: int segment byte size %u not divisible by 4\n", s->size_in_bytes);
+        return -1;
+    }
+    if ((s->type == SEG_DOUBLE || s->type == SEG_DOUBLE_ARRAY) && (s->size_in_bytes % 8 != 0)) {
+        fprintf(stderr, "validate_segment_on_receive: double segment byte size %u not divisible by 8\n", s->size_in_bytes);
+        return -1;
+    }
+
+    if (s->type == SEG_STRING) {
+        /* Accept either:
+           - raw buffer present and last byte is '\0'
+           - or sval present (string pointer) and its length equals count
+           (this handles the common `sval = raw; raw = NULL` pattern).
+        */
+        if (s->raw != NULL) {
+            if ((unsigned char) s->raw[s->size_in_bytes - 1] != '\0') {
+                fprintf(stderr, "validate_segment_on_receive: string raw last byte is not '\\0'\n");
+                return -1;
+            }
+        } else if (s->sval != NULL) {
+            /* sval should be null-terminated and its strlen should equal count */
+            size_t ls = strlen(s->sval);
+            if (ls != (size_t) s->count) {
+                fprintf(stderr, "validate_segment_on_receive: sval length %zu != count %u\n", ls, s->count);
+                return -1;
+            }
+            /* also ensure underlying memory was not truncated (size_in_bytes >= count+1) */
+        } else {
+            fprintf(stderr, "validate_segment_on_receive: string has neither raw nor sval\n");
+            return -1;
+        }
+    }
+
+    if (s->type == SEG_BOOL && s->count > 0) {
+        if (!s->bvals && !s->ivals) {
+            fprintf(stderr, "validate_segment_for_send: bool segment has no backing storage\n");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/* validate whole message after receive */
+static int validate_message_on_receive(const MESSAGE *m) {
+    if (!m) return -1;
+    SEGMENT *s = m->head;
+    while (s) {
+        if (validate_segment_on_receive(s) != 0) {
+            fprintf(stderr, "validate_message_on_receive: segment validate failed (type=%u)\n", s->type);
+            return -1;
+        }
+        s = s->next;
     }
     return 0;
 }
@@ -644,8 +815,16 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
         if (recv_all(ai->conn_fd, chunk, (int)len) <= 0) { fprintf(stderr,"recv chunk payload failed\n"); free(chunk); goto fail; }
 
         if (len == strlen(END_STR) && memcmp(chunk, END_STR, strlen(END_STR)) == 0) {
+            fprintf(stderr,"received END marker, sending END ACK...\n");
             if (send_all(ai->conn_fd, ok_msg, (int)strlen(OK_STR)) != (int)strlen(OK_STR)) { fprintf(stderr,"send ok failed\n"); free(chunk); goto fail; }
             free(chunk);
+            if (validate_message_on_receive(m) != 0) {
+                fprintf(stderr, "receive_message: validation failed on assembled message\n");
+                // free message and return error
+                free_message(m);
+                *outMessage = NULL;
+                goto fail;   // or return -1 after cleaning as you already do
+            }
             *outMessage = m;
             return 0;
         }
@@ -736,7 +915,7 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
                         if (cur_segment->size_in_bytes > 0) cur_segment->raw[cur_segment->size_in_bytes - 1] = '\0';
                         // you can also set cur_segment->sval = cur_segment->raw;  // reuse raw as string
                         cur_segment->sval = cur_segment->raw; // reuse raw buffer for string convenience
-                        cur_segment->raw = NULL; // prevent double-free (we moved ownership)
+                        cur_segment->raw = NULL; // prevent double-free (we moved ownership) *********** IMPORTANT ***********
                     }
 
                     if (!m->head) m->head = m->tail = cur_segment;
@@ -807,7 +986,7 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
                         // Make sval point to raw
                         if (cur_segment->size_in_bytes > 0) cur_segment->raw[cur_segment->size_in_bytes-1] = '\0';
                         cur_segment->sval = cur_segment->raw;
-                        cur_segment->raw = NULL; // raw is now owned by sval
+                        cur_segment->raw = NULL; // prevent double-free (we moved ownership) *********** IMPORTANT ***********
                     }
 
                     // Add to message linked list
@@ -827,6 +1006,7 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
         } // end while pos < len
 
         /* send ack for chunk */
+        fprintf(stderr,"chunk received, sending ack...\n");
         if (send_all(ai->conn_fd, ack_msg, (int)ack_len) != (int)ack_len) {
             fprintf(stderr,"send ack failed\n"); free(chunk); goto fail;
         }
@@ -852,36 +1032,18 @@ fail:
     return -1;
 }
 
-/* free_message */
-void free_message(void* message_v) {
-    MESSAGE *m = (MESSAGE*)message_v;
-    if (!m) return;
-    SEGMENT *s = m->head;
-    while (s) {
-        SEGMENT *n = s->next;
-        if (s->raw) { free(s->raw); s->raw = NULL; }
-        if (s->sval) { free(s->sval); s->sval = NULL; } // note: for strings we may have set sval=raw and raw=NULL
-        if (s->ivals) { free(s->ivals); s->ivals = NULL; }
-        if (s->dvals) { free(s->dvals); s->dvals = NULL; }
-        if (s->bvals) { free(s->bvals); s->bvals = NULL; }
-        free(s);
-        s = n;
-    }
-    free(m);
-}
-
 int Send_receive_message(void* handle, void* message_v, void** outMessage) {
     // Your spec: "will call send_message if message is not null; will call receive_message if outmessage is not null"
     // I provide a function that does both as appropriate; returns 0 on success, -1 on error.
     if (!handle) return -1;
     int rc = 0;
     if (message_v) {
-        printf("Sending Message to Python\n");
+        fprintf(stderr,"\nSending Message to Python\n");
         rc = send_message(handle, message_v);
         if (rc != 0) return -1;
     }
     if (outMessage) {
-        printf("Receiving Message from Python\n");
+        fprintf(stderr,"\nReceiving Message from Python\n");
         rc = receive_message(handle, outMessage);
         if (rc != 0) return -1;
     }
@@ -908,6 +1070,80 @@ void* get_variable_from_message(void* message_v, uint32_t index, uint16_t *type_
     if (type_ptr) *type_ptr = s->type;
     if (count_ptr) *count_ptr = s->count;
     return (void*) s;
+}
+
+static void debug_print_segment(const SEGMENT* s, int want_raw) {
+    if (!s) { fprintf(stderr,"NULL SEGMENT]\n"); return; }
+
+    fprintf(stderr,"Segment Debug Info : \n");
+
+    fprintf(stderr,"Type: %d\n", s->type);
+    fprintf(stderr,"Count: %d\n", s->count);
+    fprintf(stderr,"Size in bytes: %d\n", s->size_in_bytes);
+
+    if (want_raw!=0) {
+        if (s->raw) {
+            fprintf(stderr,"Raw (hex): ");
+            unsigned int limit = s->size_in_bytes;
+            for (unsigned int i = 0; i < limit; i++) fprintf(stderr,"%02X", (unsigned char)s->raw[i]);
+            fprintf(stderr,"\n");
+        } 
+        else if(s->type == SEG_STRING && s->sval){
+            fprintf(stderr,"Raw (hex): ");
+            for (unsigned int i = 0; i < s->size_in_bytes; i++){
+                fprintf(stderr,"%02X", (unsigned char)s->sval[i]); 
+            }
+            fprintf(stderr,"\n");
+        } else {
+            fprintf(stderr,"Raw buffer: NULL\n");
+        }
+    }
+
+    if (s->ivals) {
+        fprintf(stderr,"Int values: ");
+        for (unsigned int i = 0; i < s->count; i++) fprintf(stderr,"%d ", s->ivals[i]);
+        fprintf(stderr,"\n");
+    }
+    if (s->dvals) {
+        fprintf(stderr,"Double values: ");
+        for (unsigned int i = 0; i < s->count; i++) fprintf(stderr,"%.3f ", s->dvals[i]);
+        fprintf(stderr,"\n");
+    }
+    if (s->bvals) {
+        fprintf(stderr,"Bool values: ");
+        for (unsigned int i = 0; i < s->count; i++) fprintf(stderr,"%d ", s->bvals[i]);
+        fprintf(stderr,"\n");
+    }
+    if (s->sval) {
+        char disp[100];
+        strncpy(disp, s->sval, sizeof(disp) - 1);
+        disp[sizeof(disp) - 1] = '\0';
+        for (char* p = disp; *p; ++p)
+            if (*p == '\n') *p = ' ';
+        if(s->type == SEG_CHAR)
+            fprintf(stderr,"Char value: '%s'\n", disp);
+        else
+            fprintf(stderr,"String value: '%s'\n", disp);
+    }
+
+}
+
+void debug_print_message(const MESSAGE* m, int want_raw) {
+    if (!m) { fprintf(stderr,"NULL MESSAGE]\n"); return; }
+
+    fprintf(stderr,"\nMessage Debug Info\n");
+    fprintf(stderr,"Total segments: %u\n", m->segment_count);
+
+    SEGMENT* s = m->head;
+    unsigned int idx = 0;
+    while (s) {
+        fprintf(stderr,"\nSegment %u\n", idx + 1);
+        debug_print_segment(s,want_raw);
+        s = s->next;
+        idx++;
+    }
+    fprintf(stderr,"\n");
+    fprintf(stderr,"End of Message\n\n");
 }
 
 
@@ -941,15 +1177,21 @@ int main() {
     int single_int = 42;
 
     /* Build message using variadic API (passes correct msg pointer) */
-    add_variable_to_message(msg,16,
+    add_variable_to_message(msg,
         SEG_INT, single_int,
         SEG_INT_ARRAY, arr, 3,
         SEG_DOUBLE_ARRAY, arr2, 4,
         SEG_DOUBLE, dval,
         SEG_CHAR, cg,
         SEG_STRING, str,
-        SEG_BOOL, check
+        SEG_BOOL, check,
+        VAR_END
     );
+    int arr1[7000];
+    for(int i=0;i<7000;i++) arr1[i] = i*10;
+    add_variable_to_message(msg,
+        SEG_INT_ARRAY, arr1, 7000,VAR_END
+    ); 
 
     /* Debug: print each segment's metadata and raw payload (hex) before sending */
     // printf("[NetSim] Built message: segments=%u total_size=%u\n", msg->segment_count, msg->total_size_in_bytes);
@@ -994,105 +1236,67 @@ int main() {
     int rc = Send_receive_message(ai_handle, msg, &reply); /* send msg, wait for reply */
 
     if (rc == 0) {
-        printf("[NetSim] Message sent and reply received successfully\n");
         if (reply) {
             MESSAGE *r = (MESSAGE*) reply;
-            printf("[NetSim] Reply: segments=%u total_size=%u\n", r->segment_count, r->total_size_in_bytes);
-            SEGMENT *seg = r->head;
-            while (seg) {
-                if (seg->raw && seg->size_in_bytes > 0) {
-                    printf("    raw(hex):");
-                    for (uint32_t i=0;i<seg->size_in_bytes;i++) {
-                        printf(" %02X", (unsigned char) seg->raw[i]);
-                    }
-                    printf("\n");
-                } else {
-                    printf("    (no raw buffer present)\n");
-                }
-                switch(seg->type) {
-                    case SEG_INT_ARRAY:
-                        for (uint32_t i=0;i<seg->count;i++)
-                            printf("  reply int[%u]=%d\n", i, seg->ivals ? seg->ivals[i] : 0);
-                        break;
-                    case SEG_INT:
-                        printf("  reply int=%d\n", seg->ivals ? seg->ivals[0] : 0);
-                        break;
-                    case SEG_DOUBLE_ARRAY:
-                    case SEG_DOUBLE:
-                        for (uint32_t i=0;i<seg->count;i++)
-                            printf("  reply double[%u]=%f\n", i, seg->dvals ? seg->dvals[i] : 0.0);
-                        break;
-                    case SEG_CHAR:
-                        if (seg->sval) printf("  reply char='%s'\n", seg->sval);
-                        else if (seg->raw && seg->size_in_bytes>0) printf("  reply char='%c'\n", seg->raw[0]);
-                        break;
-                    case SEG_STRING:
-                        printf("  reply string='%s'\n", seg->sval ? seg->sval : "");
-                        break;
-                    case SEG_BOOL:
-                        if (seg->bvals) {
-                            for (uint32_t i=0;i<seg->count;i++) printf("  reply bool[%u]=%u\n", i, (unsigned)seg->bvals[i]);
-                        } else if (seg->ivals) {
-                            for (uint32_t i=0;i<seg->count;i++) printf("  reply bool[%u]=%d\n", i, seg->ivals[i]);
-                        } else {
-                            printf("  reply bool (no storage)\n");
-                        }
-                        break;
-                    default:
-                        printf("  reply unknown-type=%u count=%u size=%u\n", seg->type, seg->count, seg->size_in_bytes);
-                }
-                seg = seg->next;
-            }
+            debug_print_message(r,0);
+            // printf("[NetSim] Reply: segments=%u total_size=%u\n", r->segment_count, r->total_size_in_bytes);
+            // SEGMENT *seg = r->head;
+            // while (seg) {
+            //     if (seg->raw && seg->size_in_bytes > 0) {
+            //         printf("    raw(hex):");
+            //         for (uint32_t i=0;i<seg->size_in_bytes;i++) {
+            //             printf(" %02X", (unsigned char) seg->raw[i]);
+            //         }
+            //         printf("\n");
+            //     } else {
+            //         printf("    (no raw buffer present)\n");
+            //     }
+            //     switch(seg->type) {
+            //         case SEG_INT_ARRAY:
+            //             for (uint32_t i=0;i<seg->count;i++)
+            //                 printf("  reply int[%u]=%d\n", i, seg->ivals ? seg->ivals[i] : 0);
+            //             break;
+            //         case SEG_INT:
+            //             printf("  reply int=%d\n", seg->ivals ? seg->ivals[0] : 0);
+            //             break;
+            //         case SEG_DOUBLE_ARRAY:
+            //         case SEG_DOUBLE:
+            //             for (uint32_t i=0;i<seg->count;i++)
+            //                 printf("  reply double[%u]=%f\n", i, seg->dvals ? seg->dvals[i] : 0.0);
+            //             break;
+            //         case SEG_CHAR:
+            //             if (seg->sval) printf("  reply char='%s'\n", seg->sval);
+            //             else if (seg->raw && seg->size_in_bytes>0) printf("  reply char='%c'\n", seg->raw[0]);
+            //             break;
+            //         case SEG_STRING:
+            //             printf("  reply string='%s'\n", seg->sval ? seg->sval : "");
+            //             break;
+            //         case SEG_BOOL:
+            //             if (seg->bvals) {
+            //                 for (uint32_t i=0;i<seg->count;i++) printf("  reply bool[%u]=%u\n", i, (unsigned)seg->bvals[i]);
+            //             } else if (seg->ivals) {
+            //                 for (uint32_t i=0;i<seg->count;i++) printf("  reply bool[%u]=%d\n", i, seg->ivals[i]);
+            //             } else {
+            //                 printf("  reply bool (no storage)\n");
+            //             }
+            //             break;
+            //         default:
+            //             printf("  reply unknown-type=%u count=%u size=%u\n", seg->type, seg->count, seg->size_in_bytes);
+            //     }
+            //     seg = seg->next;
+            // }
             free_message(reply);
         } else {
-            printf("[NetSim] send succeeded but reply pointer is NULL\n");
+            printf("send succeeded but reply pointer is NULL\n");
         }
     } else {
-        printf("[NetSim] Send_receive_message failed (rc=%d). Possibly no reply or socket error.\n", rc);
+        printf("Send_receive_message failed (rc=%d). Possibly no reply or socket error.\n", rc);
     }
 
     /* Clean up */
     free_message(msg);
     /* Bidirectional loop: C can send or receive as needed */
     // printf("[NetSim] Ready for further message exchanges. Entering bidirectional loop...\n");
-    MESSAGE *out_msg = Init_Message();
-    int arr1[100];
-    for(int i=0;i<100;i++) arr1[i] = i*10;
-    while (1) {
-        add_intarray_to_message(out_msg, arr1, 100);
-        int val = 12342080;
-        add_int_to_message(out_msg, val);
-        const char *reply_str = "C says hello again";
-        add_string_to_message(out_msg, reply_str);
-        int rc = send_message(ai_handle, out_msg);
-        if (rc == 0) {
-            printf("[NetSim] Sent message to Python client.\n");
-        } else {
-            printf("[NetSim] send_message failed or connection closed.\n");
-            free_message(out_msg);
-            break;
-        }
-        free_message(out_msg);
-
-        void *new_msg = NULL;
-        int rc1 = receive_message(ai_handle, &new_msg);
-        MESSAGE *r = (MESSAGE*) new_msg;
-        if (rc1 == 0 && new_msg) {
-            printf("[NetSim] Received new message: segments=%u total_size=%u\n", r->segment_count, r->total_size_in_bytes);
-            SEGMENT *seg = r->head;
-            if(seg->type == SEG_INT_ARRAY && seg->ivals){
-                for(int i=0;i<seg->count;i++){
-                    if(i<10) // print first 10 values
-                        printf("  recv int[%u]=%d\n", i, seg->ivals[i]);
-                }
-            }
-            /* Optionally process new_msg here */
-
-            free_message(new_msg);
-        } else {
-            printf("[NetSim] Connection closed or error occurred. Exiting loop.\n");
-            break;
-        }
         /* Example: decide whether to send or receive (replace with your own logic) */
     //     printf("[NetSim] Enter 's' to send, 'r' to receive, 'q' to quit: ");
     //     char cmd[8] = {0};
@@ -1128,7 +1332,7 @@ int main() {
     //             break;
     //         }
     //     }
-    }
+    // }
 
     /* Clean up sockets and resources */
     if (ai->conn_fd != SOCK_INVALID) sock_close(ai->conn_fd);
