@@ -49,6 +49,25 @@ extern "C" {
 #define SEG_INT_ARRAY    6
 #define SEG_DOUBLE_ARRAY 7
 
+/* Macros for logging */
+#define LOG_INFO(fmt, ...) do { \
+    if (g_log) fprintf(g_log, "INFO: " fmt, ##__VA_ARGS__); \
+    if (g_log_to_console) fprintf(stdout, "INFO: " fmt, ##__VA_ARGS__); \
+    if (g_log) fflush(g_log); \
+} while(0)
+
+#define LOG_WARN(fmt, ...) do { \
+    if (g_log) fprintf(g_log, "WARN: " fmt, ##__VA_ARGS__); \
+    if (g_log_to_console) fprintf(stderr, "WARN: " fmt, ##__VA_ARGS__); \
+    if (g_log) fflush(g_log); \
+} while(0)
+
+#define LOG_ERR(fmt, ...) do { \
+    if (g_log) fprintf(g_log, "ERROR: " fmt, ##__VA_ARGS__); \
+    if (g_log_to_console) fprintf(stderr, "ERROR: " fmt, ##__VA_ARGS__); \
+    if (g_log) fflush(g_log); \
+} while(0)
+
 /* Forward-declare sock_t for use in API docs (actual typedef exists in implementation) */
 typedef void* sock_placeholder_t;
 
@@ -74,6 +93,7 @@ typedef struct SEGMENT {
 typedef struct MESSAGE {
     SEGMENT *head;
     SEGMENT *tail;
+    SEGMENT *cursor; /* pointer to current segment */
     uint32_t segment_count;
     uint32_t total_size_in_bytes;
 } MESSAGE;
@@ -88,18 +108,29 @@ typedef struct AI_HANDLE {
 
 /* === Initialization / teardown === */
 
+/* Initialize logging subsystem (call before any logging). path tells where to write logs,
+ * if to_console is non-zero, also log to stdout/stderr. Returns 0 on success, -1 on failure. */
+int init_logging(const char *path, int to_console);
+
+/* Get the current value segment from a message (if any). */
+SEGMENT* msg_get_value(MESSAGE* m);
+
+/* Reset the message cursor and segment list. */
+void msg_reset(MESSAGE* m);
+
+
 /* Initialize Winsock, create listening socket, accept a client and return AI_HANDLE*.
  * This is a convenience helper that does accept() internally (blocking).
  * Caller must eventually cleanup sockets and call WSACleanup() (implementation may or may not do it).
  * Returns NULL on failure. */
-void* Init_AI_ML_Interface(void);
+void* Init_AI_ML_Interface();
 
 /* Free a MESSAGE and its segments (frees segment->raw or typed buffers if allocated).
  * Safe to call with NULL. */
 void free_message(void* message_v);
 
 /* Initialize an empty MESSAGE object (caller must free via free_message). */
-MESSAGE* Init_Message(void);
+MESSAGE* Init_Message();
 
 /* === add_variable_to_message (variadic) ===
    Usage pattern:
@@ -134,7 +165,7 @@ void add_variable_to_message(void *message_v, ...);
 
 /* Combined helper: send_message if message_v != NULL, then receive_message if outMessage != NULL.
  * Returns 0 on success, -1 on error. */
-int Send_receive_message(void* handle, void* message_v, void** outMessage);
+int send_receive_message(void* handle, void* message_v, MESSAGE** outMessage);
 
 /* === Convenience accessors (optional helpers) === */
 

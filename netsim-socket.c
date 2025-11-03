@@ -41,6 +41,9 @@ typedef SOCKET sock_t;
 #define SOCK_ERR SOCKET_ERROR
 #define sock_close(s) closesocket(s)
 
+static FILE *g_log = NULL;
+static int g_log_to_console = 1; /* set 0 to disable console echo */
+
 /* Portable 64-bit byte-swap helpers.
    Use MSVC intrinsic if available else builtin.
 */
@@ -76,10 +79,50 @@ static inline uint64_t portable_ntohll(uint64_t x) {
 #endif
 }
 
+/* Macros for logging */
+#define LOG_INFO(fmt, ...) do { \
+    if (g_log) fprintf(g_log, "INFO: " fmt, ##__VA_ARGS__); \
+    if (g_log_to_console) fprintf(stdout, "INFO: " fmt, ##__VA_ARGS__); \
+    if (g_log) fflush(g_log); \
+} while(0)
+
+#define LOG_WARN(fmt, ...) do { \
+    if (g_log) fprintf(g_log, "WARN: " fmt, ##__VA_ARGS__); \
+    if (g_log_to_console) fprintf(stderr, "WARN: " fmt, ##__VA_ARGS__); \
+    if (g_log) fflush(g_log); \
+} while(0)
+
+#define LOG_ERR(fmt, ...) do { \
+    if (g_log) fprintf(g_log, "ERROR: " fmt, ##__VA_ARGS__); \
+    if (g_log_to_console) fprintf(stderr, "ERROR: " fmt, ##__VA_ARGS__); \
+    if (g_log) fflush(g_log); \
+} while(0)
+
 /* Sleep helper (seconds) */
 static inline void sleep_secs(unsigned int s) {
     Sleep(s * 1000u);
 }
+
+/* Close logging when program exits */
+void close_logging(void) {
+    if (g_log) {
+        fflush(g_log);
+        fclose(g_log);
+        g_log = NULL;
+    }
+}
+
+/* Initialize logging: call once early (pass path like "netsim_log.txt") */
+int init_logging(const char *path, int to_console) {
+    remove(path); /* delete existing log */
+    g_log_to_console = to_console ? 1 : 0;
+    g_log = fopen(path, "a"); /* append */
+    if (!g_log) return -1;
+    setvbuf(g_log, NULL, _IOLBF, BUFSIZ); /* line buffered */
+    atexit(close_logging);
+    return 0;
+}
+
 
 /* send_all / recv_all helpers (blocking) */
 static int send_all(sock_t sock, const void *buf, int len) {
@@ -122,9 +165,10 @@ typedef struct SEGMENT {
 typedef struct MESSAGE {
     SEGMENT *head;
     SEGMENT *tail;
+    SEGMENT *cursor; /* pointer to current segment */
     uint32_t segment_count;
     uint32_t total_size_in_bytes;
-} MESSAGE;
+}  MESSAGE;
 
 typedef struct {
     sock_t listen_fd;
@@ -146,7 +190,7 @@ static inline uint32_t elem_size_by_type(uint16_t t) {
 void* Init_AI_ML_Interface() {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
-        fprintf(stderr, "WSAStartup failed\n");
+        LOG_ERR("WSAStartup failed\n");
         return NULL;
     }
 
@@ -158,7 +202,7 @@ void* Init_AI_ML_Interface() {
 
     sock_t sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == SOCK_INVALID) {
-        fprintf(stderr, "socket() failed: %d\n", WSAGetLastError());
+        LOG_ERR("socket() failed: %d\n", WSAGetLastError());
         free(h);
         WSACleanup();
         return NULL;
@@ -166,7 +210,7 @@ void* Init_AI_ML_Interface() {
 
     int opt = 1;
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt)) == SOCKET_ERROR) {
-        fprintf(stderr, "setsockopt failed: %d\n", WSAGetLastError());
+        LOG_ERR("setsockopt failed: %d\n", WSAGetLastError());
         sock_close(sockfd);
         free(h);
         WSACleanup();
@@ -180,7 +224,7 @@ void* Init_AI_ML_Interface() {
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        fprintf(stderr, "bind failed: %d\n", WSAGetLastError());
+        LOG_ERR("bind failed: %d\n", WSAGetLastError());
         sock_close(sockfd);
         free(h);
         WSACleanup();
@@ -188,21 +232,21 @@ void* Init_AI_ML_Interface() {
     }
 
     if (listen(sockfd, BACKLOG) == SOCKET_ERROR) {
-        fprintf(stderr, "listen failed: %d\n", WSAGetLastError());
+        LOG_ERR("listen failed: %d\n", WSAGetLastError());
         sock_close(sockfd);
         free(h);
         WSACleanup();
         return NULL;
     }
 
-    printf("Listening on port %d...\n", PORT);
+    LOG_INFO("Listening on port %d...\n", PORT);
     h->listen_fd = sockfd;
 
     struct sockaddr_in cli;
     int clilen = sizeof(cli);
     sock_t conn = accept(sockfd, (struct sockaddr*)&cli, &clilen);
     if (conn == SOCK_INVALID) {
-        fprintf(stderr, "accept failed: %d\n", WSAGetLastError());
+        LOG_ERR("accept failed: %d\n", WSAGetLastError());
         sock_close(sockfd);
         free(h);
         WSACleanup();
@@ -210,13 +254,40 @@ void* Init_AI_ML_Interface() {
     }
 
     h->conn_fd = conn;
-    printf("Client connected.\n");
+    LOG_INFO("Client connected.\n");
     return (void*)h;
+}
+
+SEGMENT* msg_get_value(MESSAGE* m)
+{
+    if (!m) return NULL;
+
+    // Initialize cursor if it's NULL (first call)
+    if (m->cursor == NULL)
+        m->cursor = m->head;
+
+    // If cursor is already NULL (no segments), done
+    if (m->cursor == NULL)
+        return NULL;
+
+    // Get current segment
+    SEGMENT* current = m->cursor;
+
+    // Move cursor to next segment for next call
+    m->cursor = current->next;
+
+    return current;
+}
+
+void msg_reset(MESSAGE* m)
+{
+    if (m) m->cursor = m->head;
 }
 
 /* Message helpers */
 MESSAGE* Init_Message() {
     MESSAGE *m = (MESSAGE*) calloc(1, sizeof(MESSAGE));
+    m->cursor = NULL;
     return m;
 }
 
@@ -483,7 +554,7 @@ void add_variable_to_message(void *message_v, ...){
                 break;
             }
             default:
-                fprintf(stderr, "add_variable_to_message: unsupported type %u\n", (unsigned int)t); /* cannot reliably skip varargs for unknown type; aborting */
+                LOG_WARN("add_variable_to_message: unsupported type %u\n", (unsigned int)t); /* cannot reliably skip varargs for unknown type; aborting */
                 va_end(ap);
                 return;
             }
@@ -610,7 +681,7 @@ static int validate_segment_for_send(const SEGMENT *s) {
     }
 
     if (s->size_in_bytes != expected_bytes) {
-        fprintf(stderr, "validate_segment_for_send: mismatch size_in_bytes (%u) vs expected (%u) for type %u\n",
+        LOG_ERR("validate_segment_for_send: mismatch size_in_bytes (%u) vs expected (%u) for type %u\n",
                 s->size_in_bytes, expected_bytes, (unsigned)s->type);
         return -1;
     }
@@ -618,31 +689,31 @@ static int validate_segment_for_send(const SEGMENT *s) {
     // type-specific checks
     if ((s->type == SEG_INT || s->type == SEG_INT_ARRAY) && s->count > 0) {
         if (!s->ivals) {
-            fprintf(stderr, "validate_segment_for_send: ivals is NULL for int segment\n");
+            LOG_ERR("validate_segment_for_send: ivals is NULL for int segment\n");
             return -1;
         }
     }
     if ((s->type == SEG_DOUBLE || s->type == SEG_DOUBLE_ARRAY) && s->count > 0) {
         if (!s->dvals) {
-            fprintf(stderr, "validate_segment_for_send: dvals is NULL for double segment\n");
+            LOG_ERR("validate_segment_for_send: dvals is NULL for double segment\n");
             return -1;
         }
     }
     if (s->type == SEG_STRING) {
         if (!s->sval) {
-            fprintf(stderr, "validate_segment_for_send: sval is NULL for string\n");
+            LOG_ERR("validate_segment_for_send: sval is NULL for string\n");
             return -1;
         }
         // ensure nul terminator present at expected position
         if ((unsigned)strlen(s->sval) != s->count) {
-            fprintf(stderr, "validate_segment_for_send: string length %zu does not equal count %u\n",
+            LOG_ERR("validate_segment_for_send: string length %zu does not equal count %u\n",
                     strlen(s->sval), s->count);
             return -1;
         }
     }
     if (s->type == SEG_BOOL && s->count > 0) {
         if (!s->bvals && !s->ivals) {
-            fprintf(stderr, "validate_segment_for_send: bool segment has no backing storage\n");
+            LOG_ERR("validate_segment_for_send: bool segment has no backing storage\n");
             return -1;
         }
     }
@@ -656,7 +727,7 @@ static int validate_message_for_send(const MESSAGE *m) {
     SEGMENT *s = m->head;
     while (s) {
         if (validate_segment_for_send(s) != 0) {
-            fprintf(stderr, "validate_message_for_send: segment validation failed (type=%u)\n", s->type);
+            LOG_ERR("validate_message_for_send: segment validation failed (type=%u)\n", s->type);
             return -1;
         }
         s = s->next;
@@ -669,7 +740,7 @@ static int send_message(void* ai_handle_v, void* message_v) {
     AI_HANDLE *ai = (AI_HANDLE*)ai_handle_v;
     MESSAGE *m = (MESSAGE*)message_v;
     if (validate_message_for_send(m) != 0) {
-        fprintf(stderr,"send_message: validation failed, aborting send\n");
+        LOG_ERR("send_message: validation failed, aborting send\n");
         return -1;
     }
     if (!ai || !m) return -1;
@@ -681,19 +752,19 @@ static int send_message(void* ai_handle_v, void* message_v) {
     while (index) {
         uint32_t n = form_segment_bytes(MAX_CHUNK_PAYLOAD, &index, payload);
         if (n == 0) {
-            fprintf(stderr,"form_segment_bytes returned 0\n");
+            LOG_WARN("form_segment_bytes returned 0\n");
             return -1;
         }
         uint32_t netlen = htonl(n);
-        if (send_all(ai->conn_fd, &netlen, 4) != 4) { fprintf(stderr,"send len failed\n"); return -1; }
-        if (send_all(ai->conn_fd, payload, n) != (int)n) { fprintf(stderr,"send payload failed\n"); return -1; }
+        if (send_all(ai->conn_fd, &netlen, 4) != 4) { LOG_ERR("send len failed\n"); return -1; }
+        if (send_all(ai->conn_fd, payload, n) != (int)n) { LOG_ERR("send payload failed\n"); return -1; }
 
-        fprintf(stderr,"chunk sent, waiting for ack...\n");
-        if (recv_all(ai->conn_fd, ack, (int)ack_len) <= 0) { fprintf(stderr,"recv ack failed\n"); return -1; }
-        fprintf(stderr,"ack received\n");
+        LOG_INFO("chunk sent, waiting for ack...\n");
+        if (recv_all(ai->conn_fd, ack, (int)ack_len) <= 0) { LOG_ERR("recv ack failed\n"); return -1; }
+        LOG_INFO("ack received\n");
         ack[ack_len] = '\0';
         if (strncmp(ack, ACK_STR, ack_len) != 0) {
-            fprintf(stderr,"expected %s, got '%s'\n", ACK_STR, ack);
+            LOG_ERR("expected %s, got '%s'\n", ACK_STR, ack);
             return -1;
         }
     }
@@ -701,16 +772,16 @@ static int send_message(void* ai_handle_v, void* message_v) {
     const char *endmsg = END_STR;
     uint32_t endlen = (uint32_t) strlen(endmsg);
     uint32_t netendlen = htonl(endlen);
-    if (send_all(ai->conn_fd, &netendlen, 4) != 4) { fprintf(stderr,"send end len failed\n"); return -1; }
-    if (send_all(ai->conn_fd, endmsg, (int)endlen) != (int)endlen) { fprintf(stderr,"send end payload failed\n"); return -1; }
-    fprintf(stderr,"sending end marker...\n");
+    if (send_all(ai->conn_fd, &netendlen, 4) != 4) { LOG_ERR("send end len failed\n"); return -1; }
+    if (send_all(ai->conn_fd, endmsg, (int)endlen) != (int)endlen) { LOG_ERR("send end payload failed\n"); return -1; }
+    LOG_INFO("sending end marker...\n");
     size_t ok_len = strlen(OK_STR);
-    if (recv_all(ai->conn_fd, ack, (int)ok_len) <= 0) { fprintf(stderr,"recv ok failed\n"); return -1; }
-    fprintf(stderr,"end ack received\n");
+    if (recv_all(ai->conn_fd, ack, (int)ok_len) <= 0) { LOG_ERR("recv ok failed\n"); return -1; }
+    LOG_INFO("end ack received\n");
 
     ack[ok_len] = '\0';
     if (strncmp(ack, OK_STR, ok_len) != 0) {
-        fprintf(stderr,"expected %s, got '%s'\n", OK_STR, ack);
+        LOG_ERR("expected %s, got '%s'\n", OK_STR, ack);
         return -1;
     }
     return 0;
@@ -725,17 +796,17 @@ static int validate_segment_on_receive(const SEGMENT *s) {
     else if (s->type == SEG_CHAR) expected_bytes = s->count;
 
     if (s->size_in_bytes != expected_bytes) {
-        fprintf(stderr, "validate_segment_on_receive: size_in_bytes (%u) != expected (%u) for type %u\n",
+        LOG_ERR("validate_segment_on_receive: size_in_bytes (%u) != expected (%u) for type %u\n",
                 s->size_in_bytes, expected_bytes, (unsigned)s->type);
         return -1;
     }
 
     if ((s->type == SEG_INT || s->type == SEG_INT_ARRAY) && (s->size_in_bytes % 4 != 0)) {
-        fprintf(stderr, "validate_segment_on_receive: int segment byte size %u not divisible by 4\n", s->size_in_bytes);
+        LOG_ERR("validate_segment_on_receive: int segment byte size %u not divisible by 4\n", s->size_in_bytes);
         return -1;
     }
     if ((s->type == SEG_DOUBLE || s->type == SEG_DOUBLE_ARRAY) && (s->size_in_bytes % 8 != 0)) {
-        fprintf(stderr, "validate_segment_on_receive: double segment byte size %u not divisible by 8\n", s->size_in_bytes);
+        LOG_ERR("validate_segment_on_receive: double segment byte size %u not divisible by 8\n", s->size_in_bytes);
         return -1;
     }
 
@@ -747,26 +818,26 @@ static int validate_segment_on_receive(const SEGMENT *s) {
         */
         if (s->raw != NULL) {
             if ((unsigned char) s->raw[s->size_in_bytes - 1] != '\0') {
-                fprintf(stderr, "validate_segment_on_receive: string raw last byte is not '\\0'\n");
+                LOG_ERR("validate_segment_on_receive: string raw last byte is not '\\0'\n");
                 return -1;
             }
         } else if (s->sval != NULL) {
             /* sval should be null-terminated and its strlen should equal count */
             size_t ls = strlen(s->sval);
             if (ls != (size_t) s->count) {
-                fprintf(stderr, "validate_segment_on_receive: sval length %zu != count %u\n", ls, s->count);
+                LOG_ERR("validate_segment_on_receive: sval length %zu != count %u\n", ls, s->count);
                 return -1;
             }
             /* also ensure underlying memory was not truncated (size_in_bytes >= count+1) */
         } else {
-            fprintf(stderr, "validate_segment_on_receive: string has neither raw nor sval\n");
+            LOG_ERR("validate_segment_on_receive: string has neither raw nor sval\n");
             return -1;
         }
     }
 
     if (s->type == SEG_BOOL && s->count > 0) {
         if (!s->bvals && !s->ivals) {
-            fprintf(stderr, "validate_segment_for_send: bool segment has no backing storage\n");
+            LOG_ERR("validate_segment_for_send: bool segment has no backing storage\n");
             return -1;
         }
     }
@@ -780,7 +851,7 @@ static int validate_message_on_receive(const MESSAGE *m) {
     SEGMENT *s = m->head;
     while (s) {
         if (validate_segment_on_receive(s) != 0) {
-            fprintf(stderr, "validate_message_on_receive: segment validate failed (type=%u)\n", s->type);
+            LOG_ERR("validate_message_on_receive: segment validate failed (type=%u)\n", s->type);
             return -1;
         }
         s = s->next;
@@ -804,22 +875,22 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
 
     while (1) {
         uint32_t netlen;
-        if (recv_all(ai->conn_fd, &netlen, 4) <= 0) { fprintf(stderr,"recv chunk len failed\n"); goto fail; }
+        if (recv_all(ai->conn_fd, &netlen, 4) <= 0) { LOG_ERR("recv chunk len failed\n"); goto fail; }
         uint32_t len = ntohl(netlen);
         if (len == 0) {
-            if (send_all(ai->conn_fd, ack_msg, (int)ack_len) != (int)ack_len) { fprintf(stderr,"send ack failed\n"); goto fail; }
+            if (send_all(ai->conn_fd, ack_msg, (int)ack_len) != (int)ack_len) { LOG_ERR("send ack failed\n"); goto fail; }
             continue;
         }
         char *chunk = (char*) malloc(len);
-        if (!chunk) { fprintf(stderr,"malloc chunk failed\n"); goto fail; }
-        if (recv_all(ai->conn_fd, chunk, (int)len) <= 0) { fprintf(stderr,"recv chunk payload failed\n"); free(chunk); goto fail; }
+        if (!chunk) { LOG_ERR("malloc chunk failed\n"); goto fail; }
+        if (recv_all(ai->conn_fd, chunk, (int)len) <= 0) { LOG_ERR("recv chunk payload failed\n"); free(chunk); goto fail; }
 
         if (len == strlen(END_STR) && memcmp(chunk, END_STR, strlen(END_STR)) == 0) {
-            fprintf(stderr,"received END marker, sending END ACK...\n");
-            if (send_all(ai->conn_fd, ok_msg, (int)strlen(OK_STR)) != (int)strlen(OK_STR)) { fprintf(stderr,"send ok failed\n"); free(chunk); goto fail; }
+            LOG_INFO("received END marker, sending END ACK...\n");
+            if (send_all(ai->conn_fd, ok_msg, (int)strlen(OK_STR)) != (int)strlen(OK_STR)) { LOG_ERR("send ok failed\n"); free(chunk); goto fail; }
             free(chunk);
             if (validate_message_on_receive(m) != 0) {
-                fprintf(stderr, "receive_message: validation failed on assembled message\n");
+                LOG_ERR("receive_message: validation failed on assembled message\n");
                 // free message and return error
                 free_message(m);
                 *outMessage = NULL;
@@ -834,7 +905,7 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
             if (pos >= len) break;
             uint8_t flag = (uint8_t) chunk[pos++];
             if (flag == 1) {
-                if (pos + 6 > len) { fprintf(stderr,"Malformed chunk header\n"); free(chunk); goto fail; }
+                if (pos + 6 > len) { LOG_ERR("Malformed chunk header\n"); free(chunk); goto fail; }
                 uint16_t nettype;
                 uint32_t netcount;
                 memcpy(&nettype, chunk + pos, 2); pos += 2;
@@ -850,14 +921,14 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
                 else payload_bytes = elem_size_by_type(type) * count;
 
                 cur_segment = (SEGMENT*) calloc(1, sizeof(SEGMENT));
-                if (!cur_segment) { fprintf(stderr,"calloc cur_segment failed\n"); free(chunk); goto fail; }
+                if (!cur_segment) { LOG_ERR("calloc cur_segment failed\n"); free(chunk); goto fail; }
                 cur_segment->type = type;
                 cur_segment->count = count;
                 cur_segment->size_in_bytes = payload_bytes;
                 cur_segment->payload_sent = 0;
                 cur_segment->next = NULL;
                 cur_segment->raw = (char*) malloc(payload_bytes ? payload_bytes : 1);
-                if (!cur_segment->raw && payload_bytes > 0) { fprintf(stderr,"malloc payload buffer failed\n"); free(cur_segment); free(chunk); goto fail; }
+                if (!cur_segment->raw && payload_bytes > 0) { LOG_ERR("malloc payload buffer failed\n"); free(cur_segment); free(chunk); goto fail; }
                 cur_received = 0;
 
                 uint32_t avail = len - pos;
@@ -874,7 +945,7 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
                     if (cur_segment->type == SEG_INT || cur_segment->type == SEG_INT_ARRAY) {
                         uint32_t num = cur_segment->count;
                         cur_segment->ivals = (int*) malloc(sizeof(int) * num);
-                        if (!cur_segment->ivals && num>0) { fprintf(stderr,"malloc ivals failed\n"); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
+                        if (!cur_segment->ivals && num>0) { LOG_ERR("malloc ivals failed\n"); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
                         for (uint32_t i=0;i<num;i++) {
                             uint32_t tmp;
                             memcpy(&tmp, cur_segment->raw + i*4, 4);
@@ -883,7 +954,7 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
                     } else if (cur_segment->type == SEG_DOUBLE || cur_segment->type == SEG_DOUBLE_ARRAY) {
                         uint32_t num = cur_segment->count;
                         cur_segment->dvals = (double*) malloc(sizeof(double) * num);
-                        if (!cur_segment->dvals && num>0) { fprintf(stderr,"malloc dvals failed\n"); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
+                        if (!cur_segment->dvals && num>0) { LOG_ERR("malloc dvals failed\n"); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
                         for (uint32_t i=0;i<num;i++) {
                             uint64_t tmpu;
                             memcpy(&tmpu, cur_segment->raw + i*8, 8);
@@ -897,9 +968,9 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
                         /* store bools as bytes in bvals and also as ints in ivals for convenience */
                         uint32_t num = cur_segment->count;
                         cur_segment->bvals = (char*) malloc(num ? num : 1);
-                        if (!cur_segment->bvals && num>0) { fprintf(stderr,"malloc bvals failed\n"); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
+                        if (!cur_segment->bvals && num>0) { LOG_ERR("malloc bvals failed\n"); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
                         cur_segment->ivals = (int*) malloc(sizeof(int) * num);
-                        if (!cur_segment->ivals && num>0) { fprintf(stderr,"malloc ivals failed\n"); free(cur_segment->bvals); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
+                        if (!cur_segment->ivals && num>0) { LOG_ERR("malloc ivals failed\n"); free(cur_segment->bvals); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
                         for (uint32_t i=0;i<num;i++) {
                             unsigned char v = (unsigned char) cur_segment->raw[i];
                             cur_segment->bvals[i] = (char) v;
@@ -928,7 +999,7 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
                 }
             } else if (flag == 0) {
                 if (!cur_segment) { 
-                    fprintf(stderr,"Continuation without current segment\n"); 
+                    LOG_WARN("Continuation without current segment\n"); 
                     free(chunk); 
                     goto fail; 
                 }
@@ -968,9 +1039,9 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
                         /* store bools as bytes in bvals and also as ints in ivals for convenience */
                         uint32_t num = cur_segment->count;
                         cur_segment->bvals = (char*) malloc(num ? num : 1);
-                        if (!cur_segment->bvals && num>0) { fprintf(stderr,"malloc bvals failed\n"); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
+                        if (!cur_segment->bvals && num>0) { LOG_ERR("malloc bvals failed\n"); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
                         cur_segment->ivals = (int*) malloc(sizeof(int) * num);
-                        if (!cur_segment->ivals && num>0) { fprintf(stderr,"malloc ivals failed\n"); free(cur_segment->bvals); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
+                        if (!cur_segment->ivals && num>0) { LOG_ERR("malloc ivals failed\n"); free(cur_segment->bvals); free(cur_segment->raw); free(cur_segment); free(chunk); goto fail; }
                         for (uint32_t i=0;i<num;i++) {
                             unsigned char v = (unsigned char) cur_segment->raw[i];
                             cur_segment->bvals[i] = (char) v;
@@ -999,16 +1070,18 @@ static int receive_message(void* ai_handle_v, void** outMessage) {
                     cur_segment = NULL;
                 }
             } else {
-                fprintf(stderr,"Unknown fragment flag: %u\n", flag);
+                LOG_ERR("Unknown fragment flag: %u\n", flag);
                 free(chunk);
                 goto fail;
             }
         } // end while pos < len
 
         /* send ack for chunk */
-        fprintf(stderr,"chunk received, sending ack...\n");
+        LOG_INFO("chunk received, sending ack...\n");
         if (send_all(ai->conn_fd, ack_msg, (int)ack_len) != (int)ack_len) {
-            fprintf(stderr,"send ack failed\n"); free(chunk); goto fail;
+            LOG_ERR("send ack failed\n");
+            free(chunk);
+            goto fail;
         }
         free(chunk);
     }
@@ -1032,18 +1105,18 @@ fail:
     return -1;
 }
 
-int Send_receive_message(void* handle, void* message_v, void** outMessage) {
+int send_receive_message(void* handle, void* message_v, void** outMessage) {
     // Your spec: "will call send_message if message is not null; will call receive_message if outmessage is not null"
     // I provide a function that does both as appropriate; returns 0 on success, -1 on error.
     if (!handle) return -1;
     int rc = 0;
     if (message_v) {
-        fprintf(stderr,"\nSending Message to Python\n");
+        LOG_INFO("Sending Message to Python\n");
         rc = send_message(handle, message_v);
         if (rc != 0) return -1;
     }
     if (outMessage) {
-        fprintf(stderr,"\nReceiving Message from Python\n");
+        LOG_INFO("Receiving Message from Python\n");
         rc = receive_message(handle, outMessage);
         if (rc != 0) return -1;
     }
@@ -1148,9 +1221,12 @@ void debug_print_message(const MESSAGE* m, int want_raw) {
 
 
 int main() {
+    if (init_logging("netsim_log.txt", 1) != 0) {
+        LOG_ERR("Could not open log file\n");
+    }
     void *ai_handle = Init_AI_ML_Interface();
     if (!ai_handle) {
-        fprintf(stderr, "Failed to init AI interface\n");
+        LOG_ERR("Failed to init AI interface\n");
         return 1;
     }
     AI_HANDLE *ai = (AI_HANDLE*) ai_handle;
@@ -1158,7 +1234,7 @@ int main() {
     /* Create a message */
     MESSAGE *msg = Init_Message();
     if (!msg) {
-        fprintf(stderr, "Failed to init message\n");
+        LOG_ERR("Failed to init message\n");
         /* cleanup */
         if (ai->conn_fd != SOCK_INVALID) sock_close(ai->conn_fd);
         if (ai->listen_fd != SOCK_INVALID) sock_close(ai->listen_fd);
@@ -1166,7 +1242,6 @@ int main() {
         WSACleanup();
         return 1;
     }
-
     /* Sample variables to send */
     int arr[] = {10, 20, 30};
     double dval = 3.14159;
@@ -1232,13 +1307,20 @@ int main() {
     // }
 
     /* Send the message and optionally receive reply (use same socket) */
-    void *reply = NULL;
-    int rc = Send_receive_message(ai_handle, msg, &reply); /* send msg, wait for reply */
-
+    void* reply = NULL;
+    int rc = send_receive_message(ai_handle, msg, &reply); /* send msg, wait for reply */
+    LOG_WARN("uykgfbuyguyk");
     if (rc == 0) {
         if (reply) {
-            MESSAGE *r = (MESSAGE*) reply;
-            debug_print_message(r,0);
+            LOG_WARN("uykgfbuyguyk");
+            // MESSAGE *r = (MESSAGE*) reply;
+            SEGMENT* s = msg_get_value(reply);
+            LOG_WARN("uykgfbuyguyk");
+            LOG_INFO("\n value received from Python: %d\n",s->ivals[0]);
+            LOG_WARN("uykgfbuyguyk");
+            s = msg_get_value(reply);
+            LOG_INFO("\n value received from Python: %s\n",s->sval);
+            debug_print_message(reply,0);
             // printf("[NetSim] Reply: segments=%u total_size=%u\n", r->segment_count, r->total_size_in_bytes);
             // SEGMENT *seg = r->head;
             // while (seg) {
@@ -1293,8 +1375,39 @@ int main() {
         printf("Send_receive_message failed (rc=%d). Possibly no reply or socket error.\n", rc);
     }
 
+    arr2[0] = 99.99; // modify to show independence
+    arr2[3] = 88.88;
+    arr[1] = 555;
+    dval = 7.7777;
+
+
     /* Clean up */
+    LOG_WARN("uykgfbuyguyk");
     free_message(msg);
+    LOG_WARN("uykgfbuyguyk");
+    msg = Init_Message();
+    LOG_WARN("uykgfbuyguyk");
+    add_variable_to_message(msg,
+        SEG_INT, single_int,
+        SEG_INT_ARRAY, arr, 3,
+        SEG_DOUBLE_ARRAY, arr2, 4,
+        SEG_DOUBLE, dval,
+        SEG_CHAR, cg,
+        SEG_STRING, str,
+        SEG_BOOL, check,
+        VAR_END
+    );
+    LOG_WARN("uykgfbuyguyk");
+    reply = NULL;
+    LOG_WARN("uykgfbuyguyk");
+    rc = send_receive_message(ai_handle, msg, &reply); /* send msg, wait for reply */
+    LOG_WARN("uykgfbuyguyk");
+    if (rc == 0) {
+        if (reply) {
+            MESSAGE *r = (MESSAGE*) reply;
+            debug_print_message(r,0);
+        }
+    }
     /* Bidirectional loop: C can send or receive as needed */
     // printf("[NetSim] Ready for further message exchanges. Entering bidirectional loop...\n");
         /* Example: decide whether to send or receive (replace with your own logic) */
@@ -1339,6 +1452,7 @@ int main() {
     if (ai->listen_fd != SOCK_INVALID) sock_close(ai->listen_fd);
     free(ai);
     WSACleanup();
+
     return 0;
 }
 

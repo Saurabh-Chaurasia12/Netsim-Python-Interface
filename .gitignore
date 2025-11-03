@@ -1,2 +1,4 @@
 *.netsimexp
 *.exe
+*.log
+*.txt

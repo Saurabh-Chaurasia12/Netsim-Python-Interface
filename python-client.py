@@ -12,10 +12,14 @@
 #  - Run the Windows C server first
 #  - Then run this client: python netsim_client.py
 #
+import os
 import socket
 import struct
 from typing import List, Tuple, Optional
 import time
+import logging
+import os
+from logging.handlers import RotatingFileHandler
 
 HOST = '127.0.0.1'
 PORT = 5555
@@ -126,12 +130,87 @@ class Segment:
 class Message:
     def __init__(self):
         self.segments: List[Segment] = []
+        self._cursor_idx = 0  # for future use
 
     def add_segment(self, seg: Segment):
         self.segments.append(seg)
 
     def __repr__(self):
         return f"Message(segments={self.segments})"
+    
+    def reset_cursor(self):
+        """Reset the internal cursor to start reading from the first segment."""
+        self._cursor_idx = 0
+    
+    def get_next_segment(self):
+        """Return next Segment object and advance cursor, or None if finished."""
+        if self._cursor_idx >= len(self.segments):
+            return None
+        s = self.segments[self._cursor_idx]
+        self._cursor_idx += 1
+        return s
+
+    def get_value(self):
+        """
+        Return tuple (python_value) for the next segment and advance cursor.
+        seg_type is an integer (SEG_*). python_value types:
+          - SEG_INT -> int
+          - SEG_DOUBLE -> float
+          - SEG_STRING/SEG_CHAR -> str
+          - SEG_BOOL -> bool or list[bool]
+          - SEG_INT_ARRAY -> list[int]
+          - SEG_DOUBLE_ARRAY -> list[float]
+          - unknown -> raw bytes
+        Returns None when no segments left.
+        """
+        seg = self.get_next_segment()
+        if seg is None:
+            return None
+
+        # If decode_from_raw wasn't called yet, call it
+        if (seg.type in (SEG_INT, SEG_INT_ARRAY) and seg.ivalues is None) \
+           or (seg.type in (SEG_DOUBLE, SEG_DOUBLE_ARRAY) and seg.dvalues is None) \
+           or (seg.type in (SEG_STRING, SEG_CHAR) and seg.svalue is None) \
+           or (seg.type == SEG_BOOL and seg.ivalues is None):
+            # decode now (safe; decode_from_raw uses seg._raw)
+            seg.decode_from_raw()
+
+        if seg.type == SEG_INT:
+            return (seg.ivalues[0] if seg.ivalues is not None else int.from_bytes(bytes(seg._raw[:4]), 'big', signed=True))
+        if seg.type == SEG_DOUBLE:
+            return (seg.dvalues[0] if seg.dvalues is not None else struct.unpack('!d', bytes(seg._raw[:8]))[0])
+        if seg.type == SEG_STRING:
+            return seg.svalue
+        if seg.type == SEG_CHAR:
+            return seg.svalue
+        if seg.type == SEG_BOOL:
+            if seg.count == 1:
+                # single bool -> return bool
+                if seg.ivalues is not None:
+                    return bool(seg.ivalues[0])
+                return bool(seg._raw[0])
+            else:
+                if seg.ivalues is not None:
+                    return [bool(x) for x in seg.ivalues]
+                return [bool(b) for b in seg._raw]
+        if seg.type == SEG_INT_ARRAY:
+            if seg.ivalues is not None:
+                return list(seg.ivalues)
+            # fallback decode from raw
+            arr = []
+            for i in range(seg.count):
+                arr.append(struct.unpack_from('!i', seg._raw, i*4)[0])
+            return arr
+        if seg.type == SEG_DOUBLE_ARRAY:
+            if seg.dvalues is not None:
+                return list(seg.dvalues)
+            arr = []
+            for i in range(seg.count):
+                arr.append(struct.unpack_from('!d', seg._raw, i*8)[0])
+            return arr
+
+        # default: return raw bytes
+        return bytes(seg._raw)
 
 # ---- Sender helpers: pack segments into fragmented chunks ----
 def pack_segment_fragmentwise(seg: Segment, start_offset: int, max_payload_bytes: int) -> Tuple[bytes,int]:
@@ -143,6 +222,42 @@ def pack_segment_fragmentwise(seg: Segment, start_offset: int, max_payload_bytes
     """
     # Not used directly by external code; send_message below builds chunks by iterating segments.
     raise NotImplementedError  # implementation is done in send_message (inline) for clarity
+
+def setup_logging(log_path="netsim_python.log",level=logging.DEBUG,max_bytes=10 * 1024 * 1024,backup_count=3,to_console=True,to_file=False):
+    logger = logging.getLogger()
+    logger.setLevel(level)
+
+    # Remove old handlers to avoid duplicates
+    if logger.handlers:
+        for h in logger.handlers[:]:
+            logger.removeHandler(h)
+
+    # Optional file logging
+    if to_file:
+        # Start fresh each run
+        if os.path.exists(log_path):
+            os.remove(log_path)
+
+        fh = RotatingFileHandler(
+            log_path, mode='w', maxBytes=max_bytes,
+            backupCount=backup_count, encoding='utf-8'
+        )
+        fh.setLevel(level)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+    # Optional console logging
+    if to_console:
+        ch = logging.StreamHandler()
+        ch.setLevel(level)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+
+    return logger
+
+logger = setup_logging()
 
 def debug_print_segment(seg, want_raw):
     """
@@ -172,10 +287,10 @@ def debug_print_segment(seg, want_raw):
     if want_raw==1:
         # Raw bytes
         if getattr(seg, "_raw", None) is not None:
-            print(f"\033[93mRaw bytes (hex):\033[0m {seg._raw.hex()}")
+            print(f"Raw bytes (hex): {seg._raw.hex()}")
             print(f"Total raw length: {len(seg._raw)}")
         else:
-            print("\033[91mRaw buffer: None\033[0m")
+            print("Raw buffer: None")
 
     # Value fields
     if getattr(seg, "ivalues", None) is not None:
@@ -198,12 +313,12 @@ def debug_print_message(msg, want_raw, title: str = "Message Debug Info"):
     Pretty-print all segments in a Message.
     """
     # print("\n" + "="*80)
-    print(f"\033[95m{title}\033[0m")
+    print(f"{title}")
     print("\n")
     # print("="*80)
-    
+
     for i, seg in enumerate(msg.segments):
-        print(f"\033[96mSegment {i+1}/{len(msg.segments)}\033[0m")
+        print(f"Segment {i+1}/{len(msg.segments)}")
         debug_print_segment(seg,want_raw)  # use our detailed segment printer
         print("\n")
 
@@ -230,32 +345,32 @@ def validate_segment_for_send(seg: Segment) -> bool:
     # if raw exists, check its length
     if hasattr(seg, "_raw") and seg._raw is not None:
         if len(seg._raw) != expected:
-            print(f"validate_segment_for_send: raw length {len(seg._raw)} != expected {expected} for type {seg.type}")
+            logger.error(f"validate_segment_for_send: raw length {len(seg._raw)} != expected {expected} for type {seg.type}")
             return False
     else:
         # if no raw, check typed lists
         if seg.type in (SEG_INT, SEG_INT_ARRAY):
             if seg.ivalues is None or len(seg.ivalues) != seg.count:
-                print("validate_segment_for_send: ivals missing or length mismatch")
+                logger.error("validate_segment_for_send: ivals missing or length mismatch")
                 return False
         elif seg.type in (SEG_DOUBLE, SEG_DOUBLE_ARRAY):
             if seg.dvalues is None or len(seg.dvalues) != seg.count:
-                print("validate_segment_for_send: dvals missing or length mismatch")
+                logger.error("validate_segment_for_send: dvals missing or length mismatch")
                 return False
         elif seg.type == SEG_STRING:
             if seg.svalue is None or len(seg.svalue) != seg.count:
-                print("validate_segment_for_send: svalue missing or length mismatch")
+                logger.error("validate_segment_for_send: svalue missing or length mismatch")
                 return False
         elif seg.type == SEG_BOOL:
             if seg.ivalues is None or len(seg.ivalues) != seg.count:
-                print("validate_segment_for_send: bool ivals missing or length mismatch")
+                logger.error("validate_segment_for_send: bool ivals missing or length mismatch")
                 return False
     # element alignment checks
     if seg.type in (SEG_INT, SEG_INT_ARRAY) and expected % 4 != 0:
-        print("validate_segment_for_send: int segment byte size not divisible by 4")
+        logger.error("validate_segment_for_send: int segment byte size not divisible by 4")
         return False
     if seg.type in (SEG_DOUBLE, SEG_DOUBLE_ARRAY) and expected % 8 != 0:
-        print("validate_segment_for_send: double segment byte size not divisible by 8")
+        logger.error("validate_segment_for_send: double segment byte size not divisible by 8")
         return False
 
     return True
@@ -263,13 +378,13 @@ def validate_segment_for_send(seg: Segment) -> bool:
 def validate_message_for_send(msg: Message) -> bool:
     for seg in msg.segments:
         if not validate_segment_for_send(seg):
-            print("validate_message_for_send: segment validation failed")
+            logger.error("validate_message_for_send: segment validation failed")
             return False
     return True
 
 def send_message(sock: socket.socket, message: Message) -> bool:
     if not validate_message_for_send(message):
-        print("send_message: validation failed, aborting send")
+        logger.error("send_message: validation failed, aborting send")
         return False
     
     for seg in message.segments:
@@ -316,26 +431,26 @@ def send_message(sock: socket.socket, message: Message) -> bool:
                 sock.sendall(struct.pack('!I', len(buf)))
                 sock.sendall(buf)
             except Exception as e:
-                print("send failed:", e)
+                logger.error("send failed:", e)
                 return False
 
-            print("Chunk sent, Waiting for ACK...")
+            logger.info("Chunk sent, Waiting for ACK...")
             ack = recv_all(sock, len(ACK_BYTES))
             if ack != ACK_BYTES:
-                print("unexpected ACK", ack)
+                logger.error("unexpected ACK", ack)
                 return False
-            print("ACK received.")
+            logger.info("ACK received.")
             sent += copy_bytes
 
     # send END
     try:
-        print("Sending END marker...")
+        logger.info("Sending END marker...")
         sock.sendall(struct.pack('!I', len(END_BYTES)))
         sock.sendall(END_BYTES)
     except Exception as e:
-        print("send END failed:", e)
+        logger.error("send END failed:", e)
         return False
-    print("END ACK Received.")
+    logger.info("END ACK Received.")
     ok = recv_all(sock, len(OK_BYTES))
     return ok==OK_BYTES
 
@@ -355,7 +470,7 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
         # 1) read 4-byte length
         ln_bytes = recv_all(sock, 4)
         if ln_bytes is None:
-            print("connection closed while reading length")
+            logger.debug("connection closed while reading length")
             return None
         (chunk_len,) = struct.unpack('!I', ln_bytes)
         if chunk_len == 0:
@@ -363,16 +478,16 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
             sock.sendall(ACK_BYTES)
             continue
         # 2) read exactly chunk_len bytes payload
-        print("Receiving chunk....")
+        logger.info("Receiving chunk....")
         chunk = recv_all(sock, chunk_len)
         if chunk is None:
-            print("connection closed while reading chunk payload")
+            logger.debug("connection closed while reading chunk payload")
             return None
 
         # check END marker
         if chunk_len == len(END_BYTES) and chunk == END_BYTES:
             # send OK and return assembled message
-            print("received END marker, sending END ACK...")
+            logger.info("received END marker, sending END ACK...")
             sock.sendall(OK_BYTES)
             return msg
 
@@ -385,7 +500,7 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
             if flag == 1:
                 # header must be present: 2 + 4 bytes
                 if pos + 6 > chunk_len:
-                    print("malformed chunk: header incomplete")
+                    logger.error("malformed chunk: header incomplete")
                     return None
                 seg_type = struct.unpack_from('!H', chunk, pos)[0]; pos += 2
                 seg_count = struct.unpack_from('!I', chunk, pos)[0]; pos += 4
@@ -421,7 +536,7 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
             elif flag == 0:
                 # continuation payload for current segment
                 if current_segment is None:
-                    print("received continuation fragment but no active segment")
+                    logger.debug("received continuation fragment but no active segment")
                     return None
                 avail = chunk_len - pos
                 want = current_segment.size_in_bytes - current_filled
@@ -436,32 +551,32 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
                     current_segment = None
                     current_filled = 0
             else:
-                print("unknown fragment flag", flag)
+                logger.error("unknown fragment flag", flag)
                 return None
         # after processing chunk, send ACK
-        print("Sending ACK...")
+        logger.info("Sending ACK...")
         sock.sendall(ACK_BYTES)
     # unreachable
 
-def send_and_receive(sock: socket.socket, message, expect_reply: bool = True, recv_timeout: Optional[float] = 5.0):
+def send_and_receive(sock: socket.socket, message, expect_reply: bool = True):
     """
     Send `message` or wait for reply.
     """
 
     if(message is not None):
-        print("\nSending message...")
+        logger.info("Sending message...")
         send_ok = send_message(sock, message)
         if not send_ok:
-            return False, None
+            return None
     if expect_reply:
-        print("\nWaiting for reply...")
+        logger.info("Waiting for reply...")
         reply = receive_message(sock)
         for seg in reply.segments:
             if not validate_segment_for_send(seg):
-                print("validate_segment_for_send (receive): segment validation failed")
-                return False, None
-        return True, reply
-    return True, None
+                logger.error("validate_segment_for_send (receive): segment validation failed")
+                return None
+        return reply
+    return None
 
 def add_variable(message: Message, var_type:int, value, length:int=0):
     """
@@ -569,8 +684,8 @@ def connect(host: str, port: int,
             s.settimeout(timeout)
             return s
         except Exception as e:
-            print(f"connect attempt {attempt+1} failed: {e}")
-            print("Retrying...")
+            logger.error(f"connect attempt {attempt+1} failed: {e}")
+            logger.info("Retrying...")
             last_exc = e
             attempt += 1
             if attempt >= retries:
@@ -593,8 +708,19 @@ c=[]
 for u in range(800):
     c.append(u*10)
 add_variable(msg, SEG_INT_ARRAY, c, 800)
+# print(msg.get_value())
+# print(msg.get_value())
+# print(msg)
+# msg.reset_cursor()
+# print(msg)
 
-print(send_and_receive(s, None,True)[1])
+print("eglqbnqj")
+print(send_and_receive(s, None,True))
+print(send_and_receive(s, msg,False))
+print(send_and_receive(s, None,True))
+print(send_and_receive(s, msg,False))
+
+# s.close()
 
 
 
