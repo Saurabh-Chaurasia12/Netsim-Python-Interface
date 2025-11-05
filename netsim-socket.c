@@ -82,7 +82,7 @@ static inline uint64_t portable_ntohll(uint64_t x) {
 /* Macros for logging */
 #define LOG_INFO(fmt, ...) do { \
     if (g_log) fprintf(g_log, "INFO: " fmt, ##__VA_ARGS__); \
-    if (g_log_to_console) fprintf(stdout, "INFO: " fmt, ##__VA_ARGS__); \
+    if (g_log_to_console) fprintf(stderr, "INFO: " fmt, ##__VA_ARGS__); \
     if (g_log) fflush(g_log); \
 } while(0)
 
