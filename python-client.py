@@ -223,7 +223,7 @@ def pack_segment_fragmentwise(seg: Segment, start_offset: int, max_payload_bytes
     # Not used directly by external code; send_message below builds chunks by iterating segments.
     raise NotImplementedError  # implementation is done in send_message (inline) for clarity
 
-def setup_logging(log_path="netsim_python.log",level=logging.DEBUG,max_bytes=10 * 1024 * 1024,backup_count=3,to_console=True,to_file=False):
+def setup_logging(log_path="netsim_python.log",level=logging.INFO,max_bytes=10 * 1024 * 1024,backup_count=3,to_console=True,to_file=False):
     logger = logging.getLogger()
     logger.setLevel(level)
 
@@ -470,7 +470,7 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
         # 1) read 4-byte length
         ln_bytes = recv_all(sock, 4)
         if ln_bytes is None:
-            logger.debug("connection closed while reading length")
+            logger.warning("connection closed while reading length")
             return None
         (chunk_len,) = struct.unpack('!I', ln_bytes)
         if chunk_len == 0:
@@ -481,7 +481,7 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
         logger.info("Receiving chunk....")
         chunk = recv_all(sock, chunk_len)
         if chunk is None:
-            logger.debug("connection closed while reading chunk payload")
+            logger.warning("connection closed while reading chunk payload")
             return None
 
         # check END marker
@@ -536,7 +536,7 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
             elif flag == 0:
                 # continuation payload for current segment
                 if current_segment is None:
-                    logger.debug("received continuation fragment but no active segment")
+                    logger.warning("received continuation fragment but no active segment")
                     return None
                 avail = chunk_len - pos
                 want = current_segment.size_in_bytes - current_filled
