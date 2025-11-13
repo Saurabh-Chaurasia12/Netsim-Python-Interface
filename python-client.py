@@ -224,6 +224,26 @@ def pack_segment_fragmentwise(seg: Segment, start_offset: int, max_payload_bytes
     raise NotImplementedError  # implementation is done in send_message (inline) for clarity
 
 def setup_logging(log_path="netsim_python.log",level=logging.INFO,max_bytes=10 * 1024 * 1024,backup_count=3,to_console=True,to_file=False):
+    """
+    Initialize and configure logging for the Python-side NetSim interface.
+
+    Parameters:
+        log_path (str): Path to the log file (default: "netsim_python.log").
+        level (int): Logging level (e.g., logging.DEBUG, logging.INFO).
+        max_bytes (int): Maximum log file size before rotation (default: 10 MB).
+        backup_count (int): Number of rotated log files to keep.
+        to_console (bool): If True, also print logs to console.
+        to_file (bool): If True, write logs to a file as well.
+
+    Usage:
+        setup_logging(level=logging.DEBUG, to_file=True)
+        logging.info("Python interface initialized")
+
+    Notes:
+        - Should be called once before any other NetSim–Python communication.
+        - Enables detailed debugging of message exchange and socket behavior.
+    """
+
     logger = logging.getLogger()
     logger.setLevel(level)
 
@@ -243,7 +263,7 @@ def setup_logging(log_path="netsim_python.log",level=logging.INFO,max_bytes=10 *
             backupCount=backup_count, encoding='utf-8'
         )
         fh.setLevel(level)
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+        fmt = logging.Formatter("[%(levelname)s] %(message)s")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
 
@@ -251,7 +271,7 @@ def setup_logging(log_path="netsim_python.log",level=logging.INFO,max_bytes=10 *
     if to_console:
         ch = logging.StreamHandler()
         ch.setLevel(level)
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+        fmt = logging.Formatter("[%(levelname)s] %(message)s")
         ch.setFormatter(fmt)
         logger.addHandler(ch)
 
@@ -284,7 +304,7 @@ def debug_print_segment(seg, want_raw):
     print(f"Segment Debug Info : \ntype={type_name} \ncount={seg.count} \nsize={seg.size_in_bytes}")
     # print("─" * 60)
 
-    if want_raw==1:
+    if want_raw>0:
         # Raw bytes
         if getattr(seg, "_raw", None) is not None:
             print(f"Raw bytes (hex): {seg._raw.hex()}")
@@ -310,7 +330,20 @@ def debug_print_segment(seg, want_raw):
 
 def debug_print_message(msg, want_raw, title: str = "Message Debug Info"):
     """
-    Pretty-print all segments in a Message.
+    Print the detailed contents of a MESSAGE object for debugging.
+
+    Parameters:
+        msg (Message): The message object received or to be sent.
+        want_raw (int): Should be non-zero positive to print raw byte payloads in hexadecimal.
+        title (str): Optional title to display before message dump.
+
+    Usage:
+        debug_print_message(message, want_raw=0)
+        debug_print_message(reply_msg, want_raw=1, title="Received Reply")
+
+    Notes:
+        - Useful for verifying correct encoding/decoding of segments.
+        - Each segment (int, double, bool, string, etc.) is displayed with its type and count.
     """
     # print("\n" + "="*80)
     print(f"{title}")
@@ -324,7 +357,7 @@ def debug_print_message(msg, want_raw, title: str = "Message Debug Info"):
 
     # print("="*80 + "\n")
 
-def validate_segment_for_send(seg: Segment) -> bool:
+def validate_segment(seg: Segment) -> bool:
     """Return True if segment is internally consistent and ready to send."""
     if seg is None:
         return False
@@ -377,7 +410,7 @@ def validate_segment_for_send(seg: Segment) -> bool:
 
 def validate_message_for_send(msg: Message) -> bool:
     for seg in msg.segments:
-        if not validate_segment_for_send(seg):
+        if not validate_segment(seg):
             logger.error("validate_message_for_send: segment validation failed")
             return False
     return True
@@ -489,6 +522,10 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
             # send OK and return assembled message
             logger.info("received END marker, sending END ACK...")
             sock.sendall(OK_BYTES)
+            for seg in msg.segments:
+                if not validate_segment(seg):
+                    logger.error("validate_segment (receive): segment validation failed")
+                    return None
             return msg
 
         # parse fragment(s) inside chunk
@@ -561,29 +598,53 @@ def receive_message(sock: socket.socket) -> Optional[Message]:
 def send_and_receive(sock: socket.socket, message, expect_reply: bool = True):
     """
     Send `message` or wait for reply.
+    Parameters:
+        sock (socket.socket): Active TCP socket connected to NetSim.
+        message (Message): Message object containing data to send. if None, only waits for reply.
+        expect_reply (bool): If True, waits for and returns a MESSAGE reply.
+
+    Returns:
+        If expect_reply is True and a reply is received, returns the Message object.
+        If no reply is expected, returns True on successful send.
+
+    Usage:
+        reply = send_and_receive(sock, message, expect_reply=True)
+        success = send_and_receive(sock, None, expect_reply=False)
+
     """
 
     if(message is not None):
         logger.info("Sending message...")
         send_ok = send_message(sock, message)
         if not send_ok:
-            return None
+            return True
     if expect_reply:
         logger.info("Waiting for reply...")
         reply = receive_message(sock)
-        for seg in reply.segments:
-            if not validate_segment_for_send(seg):
-                logger.error("validate_segment_for_send (receive): segment validation failed")
-                return None
-        return reply
-    return None
+        if reply is not None:
+            logger.info("Received reply")
+            return reply
+    return True
 
 def add_variable(message: Message, var_type:int, value, length:int=0):
     """
-    Robust helper that mirrors C add_variable_to_message.
-    - For arrays: if length==0 we infer len(value).
-    - Builds seg._raw in network byte order and sets seg.size_in_bytes.
-    - Sets typed lists (ivalues/dvalues/svalue) for convenience.
+    Append a variable or array to a message before sending to NetSim.
+
+    Parameters:
+        message (Message): The message to which the variable is added.
+        var_type (int): One of SEG_INT, SEG_DOUBLE, SEG_BOOL, SEG_STRING, etc.
+        value: The variable or list/array of values to send.
+        length (int): Number of elements if sending an array (ignored for single values).
+
+    Usage:
+        msg = Message()
+        add_variable(msg, SEG_INT, 123)
+        add_variable(msg, SEG_STRING, "Hello")
+        add_variable(msg, SEG_DOUBLE_ARRAY, [1.1, 2.2, 3.3], length=3)
+
+    Notes:
+        - Must call add_variable() for each segment before send_and_receive().
+        - Each variable type is automatically encoded to the correct binary format.
     """
     # infer length for arrays if caller didn't pass it
     if var_type in (SEG_INT_ARRAY, SEG_DOUBLE_ARRAY) and length == 0:
@@ -660,14 +721,32 @@ def add_variable(message: Message, var_type:int, value, length:int=0):
 def connect(host: str, port: int,
             retries: int = 6,
             backoff: float = 1.0,
-            timeout: Optional[float] = 10.0,
+            timeout: Optional[float] = 1000000.0,
             keepalive: bool = True) -> socket.socket:
     """
-    Try to connect to (host,port). Retries up to `retries` times with exponential backoff.
-    Returns a connected socket. Raises ConnectionError on failure.
+    Establish a TCP connection from Python to the NetSim socket server.
 
-    keepalive: if True, sets SO_KEEPALIVE (note: tuning keepalive intervals on Windows requires extra IOCTLs).
-    timeout: socket timeout for connect/recv operations (seconds). None = blocking.
+    Parameters:
+        host (str): IP address or hostname where NetSim is running.
+        port (int): TCP port number (must match the port in NetSim’s Init_AI_ML_Interface()).
+        retries (int): Number of connection attempts before giving up (default: 6).
+        backoff (float): Seconds to wait between retries.
+        timeout (float | None): Socket timeout in seconds (default: large value to block indefinitely).
+        keepalive (bool): Enables TCP keepalive to detect dead connections.
+
+    Returns:
+        socket.socket: Connected socket ready for send_and_receive().
+
+    Usage:
+        sock = connect("127.0.0.1", 5555)
+        print("Connected to NetSim")
+        ...
+        sock.close()
+
+    Notes:
+        - Must be called before attempting any data exchange.
+        - Works across computers on the same network (ensure firewall allows the port).
+        - To connect across networks, ensure both systems can reach each other’s IP and port.
     """
     last_exc = None
     attempt = 0

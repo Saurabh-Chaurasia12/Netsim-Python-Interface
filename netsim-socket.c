@@ -115,7 +115,7 @@ void close_logging(void) {
 /* Initialize logging: call once early (pass path like "netsim_log.txt") */
 int init_logging(const char *path, int to_console) {
     remove(path); /* delete existing log */
-    g_log_to_console = to_console ? 1 : 0;
+    g_log_to_console = to_console > 0 ? 1 : 0;
     g_log = fopen(path, "a"); /* append */
     if (!g_log) return -1;
     setvbuf(g_log, NULL, _IOLBF, BUFSIZ); /* line buffered */
@@ -1154,7 +1154,7 @@ static void debug_print_segment(const SEGMENT* s, int want_raw) {
     fprintf(stderr,"Count: %d\n", s->count);
     fprintf(stderr,"Size in bytes: %d\n", s->size_in_bytes);
 
-    if (want_raw!=0) {
+    if (want_raw > 0) {
         if (s->raw) {
             fprintf(stderr,"Raw (hex): ");
             unsigned int limit = s->size_in_bytes;
